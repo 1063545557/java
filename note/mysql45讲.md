@@ -2777,10 +2777,10 @@ select SQL_BIG_RESULT id%100 as m, count(*) as c from t1 group by m;
 ```
 的执行流程就是这样的：
 
-1.初始化sort_buffer，确定放入一个整型字段，记为m；
-2.扫描表t1的索引a，依次取出里面的id值, 将 id%100的值存入sort_buffer中；
-3.扫描完成后，对sort_buffer的字段m做排序（如果sort_buffer内存不够用，就会利用磁盘临时文件辅助排序）；
-4.排序完成后，就得到了一个有序数组。
+1. 初始化sort_buffer，确定放入一个整型字段，记为m；
+2. 扫描表t1的索引a，依次取出里面的id值, 将 id%100的值存入sort_buffer中；
+3. 扫描完成后，对sort_buffer的字段m做排序（如果sort_buffer内存不够用，就会利用磁盘临时文件辅助排序）；
+4. 排序完成后，就得到了一个有序数组。
 根据有序数组，得到数组里面的不同值，以及每个值的出现次数。
 
 ![](https://github.com/1063545557/java/blob/main/img/mysql45%E8%AE%B2_67.png?raw=true)
@@ -2791,7 +2791,7 @@ select SQL_BIG_RESULT id%100 as m, count(*) as c from t1 group by m;
 
 基于上面的union、union all和group by语句的执行过程的分析，我们来回答文章开头的问题：MySQL什么时候会使用内部临时表？
 
-1.如果语句执行过程可以一边读数据，一边直接得到结果，是不需要额外内存的，否则就需要额外的内存，来保存中间结果；
-2.join_buffer是无序数组，sort_buffer是有序数组，临时表是二维表结构；
-3.如果执行逻辑需要用到二维表特性，就会优先考虑使用临时表。比如我们的例子中，union需要用到唯一索引约束， group by还需要用到另外一个字段来存累积计数。
+1. 如果语句执行过程可以一边读数据，一边直接得到结果，是不需要额外内存的，否则就需要额外的内存，来保存中间结果；
+2. join_buffer是无序数组，sort_buffer是有序数组，临时表是二维表结构；
+3. 如果执行逻辑需要用到二维表特性，就会优先考虑使用临时表。比如我们的例子中，union需要用到唯一索引约束， group by还需要用到另外一个字段来存累积计数。
 
