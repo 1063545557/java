@@ -2681,7 +2681,7 @@ MySQL在记录binlog的时候，会把主库执行这个语句的线程id写到b
 
 由于table_def_key不同，所以这两个表在备库的应用线程里面是不会冲突的。
 
-## 37,什么时候会使用内部临时表
+## 37讲,什么时候会使用内部临时表
 
 **union 执行流程**
 ![](https://github.com/1063545557/java/blob/main/img/mysql45%E8%AE%B2_63.png?raw=true)
@@ -2795,3 +2795,4 @@ select SQL_BIG_RESULT id%100 as m, count(*) as c from t1 group by m;
 2. join_buffer是无序数组，sort_buffer是有序数组，临时表是二维表结构；
 3. 如果执行逻辑需要用到二维表特性，就会优先考虑使用临时表。比如我们的例子中，union需要用到唯一索引约束， group by还需要用到另外一个字段来存累积计数。
 
+## 38讲，都说InnoDB好，那还要不要使用Memory引擎
