@@ -4377,3 +4377,261 @@ select * from t1 join temp_t on (t1.b=temp_t.b);
 2. 否则，自增值不变。
 
 这就引入了我们文章开头提到的问题，在这两个参数都设置为1的时候，自增主键id却不能保证是连续的，这是什么原因呢？
+
+**自增值的修改时机**
+
+假设，表t里面已经有了(1,1,1)这条记录，这时我再执行一条插入数据命令：
+```
+insert into t values(null, 1, 1);
+```
+这个语句的执行流程就是：
+
+1. 执行器调用InnoDB引擎接口写入一行，传入的这一行的值是(0,1,1);
+2. InnoDB发现用户没有指定自增id的值，获取表t当前的自增值2；
+3. 将传入的行的值改成(2,1,1);
+4. 将表的自增值改成3；
+5. 继续执行插入数据操作，由于已经存在c=1的记录，所以报Duplicate key error，语句返回。
+
+可以看到，这个表的自增值改成3，是在真正执行插入数据的操作之前。这个语句真正执行的时候，因为碰到唯一键c冲突，所以id=2这一行并没有插入成功，但也没有将自增值再改回去。
+
+所以，在这之后，再插入新的数据行时，拿到的自增id就是3。也就是说，出现了自增主键不连续的情况。
+
+![](https://github.com/1063545557/java/blob/main/img/mysql45%E8%AE%B2_72.png?raw=true)
+
+可以看到，这个操作序列复现了一个自增主键id不连续的现场(没有id=2的行）。可见，**唯一键冲突是导致自增主键id不连续的第一种原因。**
+
+同样地，**事务回滚也会产生类似的现象，这就是第二种原因。**
+
+下面这个语句序列就可以构造不连续的自增id
+```
+insert into t values(null,1,1);
+begin;
+insert into t values(null,2,2);
+rollback;
+insert into t values(null,2,2);
+//插入的行是(3,2,2)
+```
+你可能会问，为什么在出现唯一键冲突或者回滚的时候，MySQL没有把表t的自增值改回去呢？如果把表t的当前自增值从3改回2，再插入新数据的时候，不就可以生成id=2的一行数据了吗？
+
+其实，MySQL这么设计是为了提升性能。接下来，我就跟你分析一下这个设计思路，看看**自增值为什么不能回退。**
+
+假设有两个并行执行的事务，在申请自增值的时候，为了避免两个事务申请到相同的自增id，肯定要加锁，然后顺序申请。
+
+1. 假设事务A申请到了id=2， 事务B申请到id=3，那么这时候表t的自增值是4，之后继续执行。
+2. 事务B正确提交了，但事务A出现了唯一键冲突。
+3. 如果允许事务A把自增id回退，也就是把表t的当前自增值改回2，那么就会出现这样的情况：表里面已经有id=3的行，而当前的自增id值是2。
+4. 接下来，继续执行的其他事务就会申请到id=2，然后再申请到id=3。这时，就会出现插入语句报错“主键冲突”。
+
+而为了解决这个主键冲突，有两种方法：
+
+1. 每次申请id之前，先判断表里面是否已经存在这个id。如果存在，就跳过这个id。但是，这个方法的成本很高。因为，本来申请id是一个很快的操作，现在还要再去主键索引树上判断id是否存在。
+2. 把自增id的锁范围扩大，必须等到一个事务执行完成并提交，下一个事务才能再申请自增id。这个方法的问题，就是锁的粒度太大，系统并发能力大大下降。
+
+可见，这两个方法都会导致性能问题。造成这些麻烦的罪魁祸首，就是我们假设的这个“允许自增id回退”的前提导致的。
+
+因此，InnoDB放弃了这个设计，语句执行失败也不回退自增id。也正是因为这样，所以才只保证了自增id是递增的，但不保证是连续的。
+
+**自增锁的优化**
+
+可以看到，自增id锁并不是一个事务锁，而是每次申请完就马上释放，以便允许别的事务再申请。其实，在MySQL 5.1版本之前，并不是这样的。
+
+接下来，我会先给你介绍下自增锁设计的历史，这样有助于你分析接下来的一个问题。
+
+在MySQL 5.0版本的时候，自增锁的范围是语句级别。也就是说，如果一个语句申请了一个表自增锁，这个锁会等语句执行结束以后才释放。显然，这样设计会影响并发度。
+
+MySQL 5.1.22版本引入了一个新策略，新增参数innodb_autoinc_lock_mode，默认值是1。
+
+1. 这个参数的值被设置为0时，表示采用之前MySQL 5.0版本的策略，即语句执行结束后才释放锁；
+2. 这个参数的值被设置为1时：
+- 普通insert语句，自增锁在申请之后就马上释放；
+- 类似insert … select这样的批量插入数据的语句，自增锁还是要等语句结束后才被释放；
+3. 这个参数的值被设置为2时，所有的申请自增主键的动作都是申请后就释放锁。
+
+你一定有两个疑问：**为什么默认设置下，insert … select 要使用语句级的锁？为什么这个参数的默认值不是2？**
+
+答案是，这么设计还是为了数据的一致性。
+
+|session A |session B|
+|----|----|
+|insert into t value(null,1,1);insert into t value(null,2,2);insert into t value(null,3,3);insert into t value(null,4,4);||
+||create table t2 like t;|
+|insert into t value(null,5,5);|insert into t2(c,d) select c,d from t|
+
+在这个例子里，我往表t1中插入了4行数据，然后创建了一个相同结构的表t2，然后两个session同时执行向表t2中插入数据的操作。
+
+你可以设想一下，如果session B是申请了自增值以后马上就释放自增锁，那么就可能出现这样的情况：
+- session B先插入了两个记录，(1,1,1)、(2,2,2)；
+- 然后，session A来申请自增id得到id=3，插入了（3,5,5)；
+- 之后，session B继续执行，插入两条记录(4,3,3)、 (5,4,4)。
+
+你可能会说，这也没关系吧，毕竟session B的语义本身就没有要求表t2的所有行的数据都跟session A相同。
+
+是的，从数据逻辑上看是对的。但是，如果我们现在的binlog_format=statement，你可以设想下，binlog会怎么记录呢？
+
+由于两个session是同时执行插入数据命令的，所以binlog里面对表t2的更新日志只有两种情况：要么先记session A的，要么先记session B的。
+
+但不论是哪一种，这个binlog拿去从库执行，或者用来恢复临时实例，备库和临时实例里面，session B这个语句执行出来，生成的结果里面，id都是连续的。这时，这个库就发生了数据不一致。
+
+你可以分析一下，出现这个问题的原因是什么？
+
+其实，这是因为原库session B的insert语句，生成的id不连续。这个不连续的id，用statement格式的binlog来串行执行，是执行不出来的。
+
+而要解决这个问题，有两种思路：
+
+1. 一种思路是，让原库的批量插入数据语句，固定生成连续的id值。所以，自增锁直到语句执行结束才释放，就是为了达到这个目的。
+2. 另一种思路是，在binlog里面把插入数据的操作都如实记录进来，到备库执行的时候，不再依赖于自增主键去生成。这种情况，其实就是innodb_autoinc_lock_mode设置为2，同时binlog_format设置为row。
+
+因此，**在生产上，尤其是有insert … select这种批量插入数据的场景时，从并发插入数据性能的角度考虑，我建议你这样设置:innodb_autoinc_lock_mode=2 ，并且 binlog_format=row**这样做，既能提升并发性，又不会出现数据一致性问题。
+
+需要注意的是，我这里说的**批量插入数据，包含的语句类型是insert … select、replace … select和load data语句。**
+
+但是，在普通的insert语句里面包含多个value值的情况下，即使innodb_autoinc_lock_mode设置为1，也不会等语句执行完成才释放锁。因为这类语句在申请自增id的时候，是可以精确计算出需要多少个id的，然后一次性申请，申请完成后锁就可以释放了。
+
+也就是说，批量插入数据的语句，之所以需要这么设置，是因为“不知道要预先申请多少个id”。
+
+既然预先不知道要申请多少个自增id，那么一种直接的想法就是需要一个时申请一个。但如果一个select … insert语句要插入10万行数据，按照这个逻辑的话就要申请10万次。显然，这种申请自增id的策略，在大批量插入数据的情况下，不但速度慢，还会影响并发插入的性能。
+
+因此，对于批量插入数据的语句，MySQL有一个批量申请自增id的策略：
+
+1. 语句执行过程中，第一次申请自增id，会分配1个；
+2. 1个用完以后，这个语句第二次申请自增id，会分配2个；
+3. 2个用完以后，还是这个语句，第三次申请自增id，会分配4个；
+4. 依此类推，同一个语句去申请自增id，每次申请到的自增id个数都是上一次的两倍。
+
+举个例子，我们一起看看下面的这个语句序列：
+```
+insert into t values(null, 1,1);
+insert into t values(null, 2,2);
+insert into t values(null, 3,3);
+insert into t values(null, 4,4);
+create table t2 like t;
+insert into t2(c,d) select c,d from t;
+insert into t2 values(null, 5,5);
+```
+insert…select，实际上往表t2中插入了4行数据。但是，这四行数据是分三次申请的自增id，第一次申请到了id=1，第二次被分配了id=2和id=3， 第三次被分配到id=4到id=7。
+
+由于这条语句实际只用上了4个id，所以id=5到id=7就被浪费掉了。之后，再执行insert into t2 values(null, 5,5)，实际上插入的数据就是（8,5,5)。
+
+**这是主键id出现自增id不连续的第三种原因。**
+
+## 40讲，insert语句的锁为什么这么多
+
+insert语句是一个很轻量的操作。不过，这个结论对于“普通的insert语句”才有效。也就是说，还有些insert语句是属于“特殊情况”的，在执行过程中需要给其他资源加锁，或者无法在申请到自增id以后就立马释放自增锁。
+**insert … select 语句**
+
+现在，我们一起来看看为什么在可重复读隔离级别下，binlog_format=statement时执行：
+```
+insert into t2(c,d) select c,d from t;
+```
+这个语句时，需要对表t的所有行和间隙加锁呢？
+
+其实，这个问题我们需要考虑的还是日志和数据的一致性。我们看下这个执行序列：
+|session A|session B|
+|----|----|
+|insert into t values(-1,-1,-1);|insert into t2(c,d) select c,d from t;|
+
+实际的执行效果是，如果session B先执行，由于这个语句对表t主键索引加了(-∞,1]这个next-key lock，会在语句执行完成后，才允许session A的insert语句执行。
+
+但如果没有锁的话，就可能出现session B的insert语句先执行，但是后写入binlog的情况。于是，在binlog_format=statement的情况下，binlog里面就记录了这样的语句序列：
+```
+insert into t values(-1,-1,-1);
+insert into t2(c,d) select c,d from t;
+```
+这个语句到了备库执行，就会把id=-1这一行也写到表t2中，出现主备不一致。
+
+**insert 循环写入**
+
+当然了，执行insert … select 的时候，对目标表也不是锁全表，而是只锁住需要访问的资源。
+
+如果现在有这么一个需求：要往表t2中插入一行数据，这一行的c值是表t中c值的最大值加1。
+
+此时，我们可以这么写这条SQL语句 ：
+```
+insert into t2(c,d)  (select c+1, d from t force index(c) order by c desc limit 1);
+```
+这个语句的加锁范围，就是表t索引c上的(4,supremum]这个next-key lock和主键索引上id=4这一行。
+
+它的执行流程也比较简单，从表t中按照索引c倒序，扫描第一行，拿到结果写入到表t2中。
+
+因此整条语句的扫描行数是1。
+
+那么，如果我们是要把这样的一行数据插入到表t中的话：
+```
+insert into t(c,d)  (select c+1, d from t force index(c) order by c desc limit 1);
+```
+语句的执行流程是怎样的？扫描行数又是多少呢？
+这时候的Rows_examined的值是5。
+如图5所示，是在执行这个语句前后查看Innodb_rows_read的结果。
+
+![](https://github.com/1063545557/java/blob/main/img/mysql45%E8%AE%B2_73.png?raw=true)
+
+可以看到，这个语句执行前后，Innodb_rows_read的值增加了4。因为默认临时表是使用Memory引擎的，所以这4行查的都是表t，也就是说对表t做了全表扫描。
+
+这样，我们就把整个执行过程理清楚了：
+
+1. 创建临时表，表里有两个字段c和d。
+2. 按照索引c扫描表t，依次取c=4、3、2、1，然后回表，读到c和d的值写入临时表。这时，Rows_examined=4。
+3. 由于语义里面有limit 1，所以只取了临时表的第一行，再插入到表t中。这时，Rows_examined的值加1，变成了5。
+
+也就是说，这个语句会导致在表t上做全表扫描，并且会给索引c上的所有间隙都加上共享的next-key lock。所以，这个语句执行期间，其他事务不能在这个表上插入数据。
+
+至于这个语句的执行为什么需要临时表，原因是这类一边遍历数据，一边更新数据的情况，如果读出来的数据直接写回原表，就可能在遍历过程中，读到刚刚插入的记录，新插入的记录如果参与计算逻辑，就跟语义不符。
+
+由于实现上这个语句没有在子查询中就直接使用limit 1，从而导致了这个语句的执行需要遍历整个表t。它的优化方法也比较简单，就是用前面介绍的方法，先insert into到临时表temp_t，这样就只需要扫描一行；然后再从表temp_t里面取出这行数据插入表t1。
+
+当然，由于这个语句涉及的数据量很小，你可以考虑使用内存临时表来做这个优化。使用内存临时表优化时，语句序列的写法如下：
+```
+create temporary table temp_t(c int,d int) engine=memory;
+insert into temp_t  (select c+1, d from t force index(c) order by c desc limit 1);
+insert into t select * from temp_t;
+drop table temp_t;
+```
+**insert 唯一键冲突**
+
+前面的两个例子是使用insert … select的情况，接下来我要介绍的这个例子就是最常见的insert语句出现唯一键冲突的情况。
+
+对于有唯一键的表，插入数据时出现唯一键冲突也是常见的情况了。我先给你举一个简单的唯一键冲突的例子。
+|session A|session B|
+|----|----|
+|insert into t values(10,10,10);||
+|begin;insert into t values(11,10,10);(Duplicate entry '10' for key 'c')||
+||insert into t values(12,9,9);(blocked)|
+
+这个例子也是在可重复读（repeatable read）隔离级别下执行的。可以看到，session B要执行的insert语句进入了锁等待状态。
+
+也就是说，session A执行的insert语句，发生主键冲突的时候，并不只是简单地报错返回，还在冲突的索引上加了锁。我们前面说过，一个next-key lock就是由它右边界的值定义的。这时候，session A持有索引c上的(5,10]共享next-key lock（读锁）。
+
+这里，我就先和你分享一个经典的死锁场景，
+||session A|session B|session C|
+|--|--|--|--|
+|T1|begin;insert into t values(null.5.5);|||
+|T2||insert into t values(null.5.5);|insert into t values(null.5.5);|
+|T3|rollback;||(Deadlock found)|
+
+在session A执行rollback语句回滚的时候，session C几乎同时发现死锁并返回。
+
+这个死锁产生的逻辑是这样的：
+
+1. 在T1时刻，启动session A，并执行insert语句，此时在索引c的c=5上加了记录锁。注意，这个索引是唯一索引，因此退化为记录锁（如果你的印象模糊了，可以回顾下第21篇文章介绍的加锁规则）。
+2. 在T2时刻，session B要执行相同的insert语句，发现了唯一键冲突，加上读锁；同样地，session C也在索引c上，c=5这一个记录上，加了读锁。
+3. T3时刻，session A回滚。这时候，session B和session C都试图继续执行插入操作，都要加上写锁。两个session都要等待对方的行锁，所以就出现了死锁。
+
+这个流程的状态变化图如下所示。
+![](https://github.com/1063545557/java/blob/main/img/mysql45%E8%AE%B2_74.png?raw=true)
+
+**insert into … on duplicate key update**
+上面这个例子是主键冲突后直接报错，如果是改写成
+```
+insert into t values(11,10,10) on duplicate key update d=100;
+```
+的话，就会给索引c上(5,10] 加一个排他的next-key lock（写锁）。
+
+**insert into … on duplicate key update 这个语义的逻辑是，插入一行数据，如果碰到唯一键约束，就执行后面的更新语句。**
+
+注意，如果有多个列违反了唯一性约束，就会按照索引的顺序，修改跟第一个索引冲突的行。
+
+现在表t里面已经有了(1,1,1)和(2,2,2)这两行，我们再来看看下面这个语句执行的效果：
+
+![](https://github.com/1063545557/java/blob/main/img/mysql45%E8%AE%B2_75.png?raw=true)
+
+需要注意的是，执行这条语句的affected rows返回的是2，很容易造成误解。实际上，真正更新的只有一行，只是在代码实现上，insert和update都认为自己成功了，update计数加了1， insert计数也加了1。
