@@ -4247,4 +4247,27 @@ select SQL_BIG_RESULT id%100 as m, count(*) as c from t1 group by m;
 alter table t1 add index a_btree_index using btree (id);
 ```
 这时，表t1的数据组织形式就变成了这样：
-![]()
+![](https://github.com/1063545557/java/blob/main/img/mysql45%E8%AE%B2_69.png?raw=true)
+
+新增的这个B-Tree索引你看着就眼熟了，这跟InnoDB的b+树索引组织形式类似。
+
+其实，一般在我们的印象中，内存表的优势是速度快，其中的一个原因就是Memory引擎支持hash索引。当然，更重要的原因是，内存表的所有数据都保存在内存，而内存的读写速度总是比磁盘快。
+
+但是，接下来我要跟你说明，为什么我不建议你在生产环境上使用内存表。这里的原因主要包括两个方面：
+
+1. 锁粒度问题；
+2. 数据持久化问题。
+
+**内存表的锁**
+
+我们先来说说内存表的锁粒度问题。
+
+内存表不支持行锁，只支持表锁。因此，一张表只要有更新，就会堵住其他所有在这个表上的读写操作。
+
+需要注意的是，这里的表锁跟之前我们介绍过的MDL锁不同，但都是表级的锁。接下来，我通过下面这个场景，跟你模拟一下内存表的表级锁。
+
+|session A|session B|session C|
+|----|----|----|
+|update t1 set id=sleep(50) where id=1;| | |
+| |select * from t1 where id=2;(wait 50s)| |
+| | |show processlist;|
