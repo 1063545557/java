@@ -4635,3 +4635,274 @@ insert into t values(11,10,10) on duplicate key update d=100;
 ![](https://github.com/1063545557/java/blob/main/img/mysql45%E8%AE%B2_75.png?raw=true)
 
 需要注意的是，执行这条语句的affected rows返回的是2，很容易造成误解。实际上，真正更新的只有一行，只是在代码实现上，insert和update都认为自己成功了，update计数加了1， insert计数也加了1。
+
+## 41讲，怎么最快地复制一张表
+
+**mysqldump方法**
+
+一种方法是，使用mysqldump命令将数据导出成一组INSERT语句。你可以使用下面的命令：
+```
+mysqldump -h$host -P$port -u$user --add-locks --no-create-info --single-transaction  --set-gtid-purged=OFF db1 t --where="a>900" --result-file=/client_tmp/t.sql
+```
+把结果输出到临时文件。
+
+这条命令中，主要参数含义如下：
+
+1. –single-transaction的作用是，在导出数据的时候不需要对表db1.t加表锁，而是使用START TRANSACTION WITH CONSISTENT SNAPSHOT的方法；
+2. –add-locks设置为0，表示在输出的文件结果里，不增加" LOCK TABLES t WRITE;" ；
+3. –no-create-info的意思是，不需要导出表结构；
+4. –set-gtid-purged=off表示的是，不输出跟GTID相关的信息；
+5. –result-file指定了输出文件的路径，其中client表示生成的文件是在客户端机器上的。
+
+如果你希望生成的文件中一条INSERT语句只插入一行数据的话，可以在执行mysqldump命令时，加上参数–skip-extended-insert。
+
+然后，你可以通过下面这条命令，将这些INSERT语句放到db2库里去执行。
+```
+mysql -h127.0.0.1 -P13000  -uroot db2 -e "source /client_tmp/t.sql"
+```
+需要说明的是，source并不是一条SQL语句，而是一个客户端命令。mysql客户端执行这个命令的流程是这样的：
+
+1. 打开文件，默认以分号为结尾读取一条条的SQL语句；
+2. 将SQL语句发送到服务端执行。
+
+也就是说，服务端执行的并不是这个“source t.sql"语句，而是INSERT语句。所以，不论是在慢查询日志（slow log），还是在binlog，记录的都是这些要被真正执行的INSERT语句。
+
+**导出CSV文件**
+
+另一种方法是直接将结果导出成.csv文件。MySQL提供了下面的语法，用来将查询结果导出到服务端本地目录：
+```
+select * from db1.t where a>900 into outfile '/server_tmp/t.csv';
+```
+我们在使用这条语句时，需要注意如下几点。
+
+1. 这条语句会将结果保存在服务端。如果你执行命令的客户端和MySQL服务端不在同一个机器上，客户端机器的临时目录下是不会生成t.csv文件的。
+2. into outfile指定了文件的生成位置（/server_tmp/），这个位置必须受参数secure_file_priv的限制。参数secure_file_priv的可选值和作用分别是：
+    - 如果设置为empty，表示不限制文件生成的位置，这是不安全的设置；
+    - 如果设置为一个表示路径的字符串，就要求生成的文件只能放在这个指定的目录，或者它的子目录；
+    - 如果设置为NULL，就表示禁止在这个MySQL实例上执行select … into outfile 操作。
+3. 这条命令不会帮你覆盖文件，因此你需要确保/server_tmp/t.csv这个文件不存在，否则执行语句时就会因为有同名文件的存在而报错。
+4. 这条命令生成的文本文件中，原则上一个数据行对应文本文件的一行。但是，如果字段中包含换行符，在生成的文本中也会有换行符。不过类似换行符、制表符这类符号，前面都会跟上“\”这个转义符，这样就可以跟字段之间、数据行之间的分隔符区分开。
+
+得到.csv导出文件后，你就可以用下面的load data命令将数据导入到目标表db2.t中。
+```
+load data infile '/server_tmp/t.csv' into table db2.t;
+```
+
+这条语句的执行流程如下所示。
+
+1. 打开文件/server_tmp/t.csv，以制表符(\t)作为字段间的分隔符，以换行符（\n）作为记录之间的分隔符，进行数据读取；
+2. 启动事务。
+3. 判断每一行的字段数与表db2.t是否相同：
+    - 若不相同，则直接报错，事务回滚；
+    - 若相同，则构造成一行，调用InnoDB引擎接口，写入到表中。
+4. 重复步骤3，直到/server_tmp/t.csv整个文件读入完成，提交事务。
+
+你可能有一个疑问，**如果binlog_format=statement，这个load语句记录到binlog里以后，怎么在备库重放呢？**
+
+由于/server_tmp/t.csv文件只保存在主库所在的主机上，如果只是把这条语句原文写到binlog中，在备库执行的时候，备库的本地机器上没有这个文件，就会导致主备同步停止。
+
+所以，这条语句执行的完整流程，其实是下面这样的。
+
+1. 主库执行完成后，将/server_tmp/t.csv文件的内容直接写到binlog文件中。
+2. 往binlog文件中写入语句load data local infile ‘/tmp/SQL_LOAD_MB-1-0’ INTO TABLE `db2`.`t`。
+3. 把这个binlog日志传到备库。
+4. 备库的apply线程在执行这个事务日志时：
+    a. 先将binlog中t.csv文件的内容读出来，写入到本地临时目录/tmp/SQL_LOAD_MB-1-0 中；
+    b. 再执行load data语句，往备库的db2.t表中插入跟主库相同的数据。
+![](https://github.com/1063545557/java/blob/main/img/mysql45%E8%AE%B2_76.png?raw=true)
+
+注意，这里备库执行的load data语句里面，多了一个“local”。它的意思是“将执行这条命令的客户端所在机器的本地文件/tmp/SQL_LOAD_MB-1-0的内容，加载到目标表db2.t中”。
+
+也就是说，**load data命令有两种用法：**
+
+1. 不加“local”，是读取服务端的文件，这个文件必须在secure_file_priv指定的目录或子目录下；
+2. 加上“local”，读取的是客户端的文件，只要mysql客户端有访问这个文件的权限即可。这时候，MySQL客户端会先把本地文件传给服务端，然后执行上述的load data流程。
+
+另外需要注意的是，**select …into outfile方法不会生成表结构文件**, 所以我们导数据时还需要单独的命令得到表结构定义。mysqldump提供了一个–tab参数，可以同时导出表结构定义文件和csv数据文件。这条命令的使用方法如下：
+```
+mysqldump -h$host -P$port -u$user ---single-transaction  --set-gtid-purged=OFF db1 t --where="a>900" --tab=$secure_file_priv
+```
+这条命令会在$secure_file_priv定义的目录下，创建一个t.sql文件保存建表语句，同时创建一个t.txt文件保存CSV数据。
+
+**物理拷贝方法**
+
+前面我们提到的mysqldump方法和导出CSV文件的方法，都是逻辑导数据的方法，也就是将数据从表db1.t中读出来，生成文本，然后再写入目标表db2.t中。
+
+你可能会问，有物理导数据的方法吗？比如，直接把db1.t表的.frm文件和.ibd文件拷贝到db2目录下，是否可行呢？
+
+答案是不行的。
+
+因为，一个InnoDB表，除了包含这两个物理文件外，还需要在数据字典中注册。直接拷贝这两个文件的话，因为数据字典中没有db2.t这个表，系统是不会识别和接受它们的。
+
+不过，在MySQL 5.6版本引入了**可传输表空间(transportable tablespace)** 的方法，可以通过导出+导入表空间的方式，实现物理拷贝表的功能。
+
+假设我们现在的目标是在db1库下，复制一个跟表t相同的表r，具体的执行步骤如下：
+
+1.执行 create table r like t，创建一个相同表结构的空表；
+2.执行alter table r discard tablespace，这时候r.ibd文件会被删除；
+3.执行flush table t for export，这时候db1目录下会生成一个t.cfg文件；
+4.在db1目录下执行cp t.cfg r.cfg; cp t.ibd r.ibd；这两个命令；
+5.执行unlock tables，这时候t.cfg文件会被删除；
+6.执行alter table r import tablespace，将这个r.ibd文件作为表r的新的表空间，由于这个文件的数据内容和t.ibd是相同的，所以表r中就有了和表t相同的数据。
+
+至此，拷贝表数据的操作就完成了。这个流程的执行过程图如下：
+![](https://github.com/1063545557/java/blob/main/img/mysql45%E8%AE%B2_77.png?raw=true)
+关于拷贝表的这个流程，有以下几个注意点：
+
+1. 在第3步执行完flsuh table命令之后，db1.t整个表处于只读状态，直到执行unlock tables命令后才释放读锁；
+2. 在执行import tablespace的时候，为了让文件里的表空间id和数据字典中的一致，会修改t.ibd的表空间id。而这个表空间id存在于每一个数据页中。因此，如果是一个很大的文件（比如TB级别），每个数据页都需要修改，所以你会看到这个import语句的执行是需要一些时间的。当然，如果是相比于逻辑导入的方法，import语句的耗时是非常短的。
+
+## 42讲，grant之后要跟着flushprivileges吗
+
+在MySQL里面，grant语句是用来给用户赋权的。不知道你有没有见过一些操作文档里面提到，grant之后要马上跟着执行一个flush privileges命令，才能使赋权语句生效。那么，grant之后真的需要执行flush privileges吗？如果没有执行这个flush命令的话，赋权语句真的不能生效吗？
+
+接下来，我就先和你介绍一下grant语句和flush privileges语句分别做了什么事情，然后再一起来分析这个问题。
+
+为了便于说明，我先创建一个用户：
+```
+create user 'ua'@'%' identified by 'pa';
+```
+这条语句的逻辑是创建一个用户’ua’@’%’，密码是pa。注意，在MySQL里面，用户名(user)+地址(host)才表示一个用户，因此 ua@ip1 和 ua@ip2代表的是两个不同的用户。
+
+这条命令做了两个动作：
+
+1. 磁盘上，往mysql.user表里插入一行，由于没有指定权限，所以这行数据上所有表示权限的字段的值都是N；
+2. 内存里，往数组acl_users里插入一个acl_user对象，这个对象的access字段值为0。
+
+下图就是这个时刻用户ua在user表中的状态。
+![](https://github.com/1063545557/java/blob/main/img/mysql45%E8%AE%B2_78.png?raw=true)
+在MySQL中，用户权限是有不同的范围的。接下来，我就按照用户权限范围从大到小的顺序依次和你说明。
+
+**全局权限**
+
+全局权限，作用于整个MySQL实例，这些权限信息保存在mysql库的user表里。如果我要给用户ua赋一个最高权限的话，语句是这么写的：
+```
+grant all privileges on *.* to 'ua'@'%' with grant option;
+```
+这个grant命令做了两个动作：
+
+1. 磁盘上，将mysql.user表里，用户’ua’@’%'这一行的所有表示权限的字段的值都修改为‘Y’；
+2. 内存里，从数组acl_users中找到这个用户对应的对象，将access值（权限位）修改为二进制的“全1”。
+
+在这个grant命令执行完成后，如果有新的客户端使用用户名ua登录成功，MySQL会为新连接维护一个线程对象，然后从acl_users数组里查到这个用户的权限，并将权限值拷贝到这个线程对象中。之后在这个连接中执行的语句，所有关于全局权限的判断，都直接使用线程对象内部保存的权限位。
+
+基于上面的分析我们可以知道：
+
+1. grant 命令对于全局权限，同时更新了磁盘和内存。命令完成后即时生效，接下来新创建的连接会使用新的权限。
+2. 对于一个已经存在的连接，它的全局权限不受grant命令的影响。
+
+需要说明的是，**一般在生产环境上要合理控制用户权限的范围。**我们上面用到的这个grant语句就是一个典型的错误示范。如果一个用户有所有权限，一般就不应该设置为所有IP地址都可以访问。
+
+如果要回收上面的grant语句赋予的权限，你可以使用下面这条命令：
+```
+revoke all privileges on *.* from 'ua'@'%';
+```
+这条revoke命令的用法与grant类似，做了如下两个动作：
+
+1. 磁盘上，将mysql.user表里，用户’ua’@’%'这一行的所有表示权限的字段的值都修改为“N”；
+2. 内存里，从数组acl_users中找到这个用户对应的对象，将access的值修改为0。
+
+**db权限**
+
+除了全局权限，MySQL也支持库级别的权限定义。如果要让用户ua拥有库db1的所有权限，可以执行下面这条命令：
+```
+grant all privileges on db1.* to 'ua'@'%' with grant option;
+```
+基于库的权限记录保存在mysql.db表中，在内存里则保存在数组acl_dbs中。这条grant命令做了如下两个动作：
+
+1. 磁盘上，往mysql.db表中插入了一行记录，所有权限位字段设置为“Y”；
+2. 内存里，增加一个对象到数组acl_dbs中，这个对象的权限位为“全1”。
+
+图中就是这个时刻用户ua在db表中的状态。
+![](https://github.com/1063545557/java/blob/main/img/mysql45%E8%AE%B2_79.png?raw=true)
+每次需要判断一个用户对一个数据库读写权限的时候，都需要遍历一次acl_dbs数组，根据user、host和db找到匹配的对象，然后根据对象的权限位来判断。
+
+也就是说，grant修改db权限的时候，是同时对磁盘和内存生效的。
+
+grant操作对于已经存在的连接的影响，在全局权限和基于db的权限效果是不同的。接下来，我们做一个对照试验来分别看一下。
+![](https://github.com/1063545557/java/blob/main/img/mysql45%E8%AE%B2_80.png?raw=true)
+
+需要说明的是，图中set global sync_binlog这个操作是需要super权限的。
+
+可以看到，虽然用户ua的super权限在T3时刻已经通过revoke语句回收了，但是在T4时刻执行set global的时候，权限验证还是通过了。这是因为super是全局权限，这个权限信息在线程对象中，而revoke操作影响不到这个线程对象。
+
+而在T5时刻去掉ua对db1库的所有权限后，在T6时刻session B再操作db1库的表，就会报错“权限不足”。这是因为acl_dbs是一个全局数组，所有线程判断db权限都用这个数组，这样revoke操作马上就会影响到session B。
+
+这里在代码实现上有一个特别的逻辑，如果当前会话已经处于某一个db里面，之前use这个库的时候拿到的库权限会保存在会话变量中。
+
+你可以看到在T6时刻，session C和session B对表t的操作逻辑是一样的。但是session B报错，而session C可以执行成功。这是因为session C在T2 时刻执行的use db1，拿到了这个库的权限，在切换出db1库之前，session C对这个库就一直有权限。
+
+**表权限和列权限**
+
+除了db级别的权限外，MySQL支持更细粒度的表权限和列权限。其中，表权限定义存放在表mysql.tables_priv中，列权限定义存放在表mysql.columns_priv中。这两类权限，组合起来存放在内存的hash结构column_priv_hash中。
+
+这两类权限的赋权命令如下：
+```
+create table db1.t1(id int, a int);
+
+grant all privileges on db1.t1 to 'ua'@'%' with grant option;
+GRANT SELECT(id), INSERT (id,a) ON mydb.mytbl TO 'ua'@'%' with grant option;
+```
+跟db权限类似，这两个权限每次grant的时候都会修改数据表，也会同步修改内存中的hash结构。因此，对这两类权限的操作，也会马上影响到已经存在的连接。
+
+看到这里，你一定会问，看来grant语句都是即时生效的，那这么看应该就不需要执行flush privileges语句了呀。
+
+答案也确实是这样的。
+
+flush privileges命令会清空acl_users数组，然后从mysql.user表中读取数据重新加载，重新构造一个acl_users数组。也就是说，以数据表中的数据为准，会将全局权限内存数组重新加载一遍。
+
+同样地，对于db权限、表权限和列权限，MySQL也做了这样的处理。
+
+也就是说，如果内存的权限数据和磁盘数据表相同的话，不需要执行flush privileges。而如果我们都是用grant/revoke语句来执行的话，内存和数据表本来就是保持同步更新的。
+
+**因此，正常情况下，grant命令之后，没有必要跟着执行flush privileges命令。**
+
+**flush privileges使用场景**
+
+那么，flush privileges是在什么时候使用呢？显然，当数据表中的权限数据跟内存中的权限数据不一致的时候，flush privileges语句可以用来重建内存数据，达到一致状态。
+
+这种不一致往往是由不规范的操作导致的，比如直接用DML语句操作系统权限表。我们来看一下下面这个场景：
+![](https://github.com/1063545557/java/blob/main/img/mysql45%E8%AE%B2_81.png?raw=true)
+
+可以看到，T3时刻虽然已经用delete语句删除了用户ua，但是在T4时刻，仍然可以用ua连接成功。原因就是，这时候内存中acl_users数组中还有这个用户，因此系统判断时认为用户还正常存在。
+
+在T5时刻执行过flush命令后，内存更新，T6时刻再要用ua来登录的话，就会报错“无法访问”了。
+
+直接操作系统表是不规范的操作，这个不一致状态也会导致一些更“诡异”的现象发生。比如，前面这个通过delete语句删除用户的例子，就会出现下面的情况：
+![](https://github.com/1063545557/java/blob/main/img/mysql45%E8%AE%B2_82.png?raw=true)
+
+可以看到，由于在T3时刻直接删除了数据表的记录，而内存的数据还存在。这就导致了：
+
+1. T4时刻给用户ua赋权限失败，因为mysql.user表中找不到这行记录；
+2. 而T5时刻要重新创建这个用户也不行，因为在做内存判断的时候，会认为这个用户还存在。
+
+## 43讲，要不要使用分区表
+
+**分区表是什么**
+
+```
+CREATE TABLE `t` (
+  `ftime` datetime NOT NULL,
+  `c` int(11) DEFAULT NULL,
+  KEY (`ftime`)
+) ENGINE=InnoDB DEFAULT CHARSET=latin1
+PARTITION BY RANGE (YEAR(ftime))
+(PARTITION p_2017 VALUES LESS THAN (2017) ENGINE = InnoDB,
+ PARTITION p_2018 VALUES LESS THAN (2018) ENGINE = InnoDB,
+ PARTITION p_2019 VALUES LESS THAN (2019) ENGINE = InnoDB,
+PARTITION p_others VALUES LESS THAN MAXVALUE ENGINE = InnoDB);
+insert into t values('2017-4-1',1),('2018-4-1',1);
+```
+我在表t中初始化插入了两行记录，按照定义的分区规则，这两行记录分别落在p_2018和p_2019这两个分区上。
+
+可以看到，这个表包含了一个.frm文件和4个.ibd文件，每个分区对应一个.ibd文件。也就是说：
+- 对于引擎层来说，这是4个表；
+- 对于Server层来说，这是1个表。
+
+你可能会觉得这两句都是废话。其实不然，这两句话非常重要，可以帮我们理解分区表的执行逻辑。
+
+**分区表的引擎层行为**
+
+我先给你举个在分区表加间隙锁的例子，目的是说明对于InnoDB来说，这是4个表。
+
+这里顺便复习一下，我在第21篇文章和你介绍的间隙锁加锁规则。
